@@ -1,0 +1,97 @@
+from flask import Blueprint, request, jsonify
+import cv2
+import os
+from app.measure import (
+    load_image,
+    preprocess,
+    get_pixel_per_mm,
+    find_foot_contour,
+    measure_foot,
+    draw_result
+)
+
+# Blueprint: Flask 라우트를 모듈별로 분리하기 위한 단위
+bp = Blueprint('main', __name__)
+
+@bp.route('/health', methods = ['GET'])
+def health():
+    """
+    서버 상태 확인용 엔드포인트
+    - 배포 후 서버가 정상 동작하는지 확인할 때 사용
+    """
+    return jsonify({"status" : "ok"}), 200
+
+@bp.route('/measure', methods=['POST'])
+def measure():
+    """
+    발 측정 메인 엔드포인트
+    - 요청: multipart/form-data 형식으로 이미지 + 가이드 박스 좌표 전송
+      - image: 이미지 파일
+      - paper_x, paper_y, paper_w, paper_h: 프론트 가이드 박스 좌표 (픽셀)
+    - 응답: 발 길이 / 발볼 너비 JSON 반환
+    """
+    if 'image' not in request.files:
+        return jsonify({"error": "이미지 파일이 없습니다."}), 400
+
+    file = request.files['image']
+    if file.filename == '':
+        return jsonify({"error": "파일명이 비어있습니다."}), 400
+
+    # 가이드 박스 좌표 파싱
+    try:
+        paper_x = int(request.form.get('paper_x', 0))
+        paper_y = int(request.form.get('paper_y', 0))
+        paper_w = int(request.form.get('paper_w', 0))
+        paper_h = int(request.form.get('paper_h', 0))
+    except ValueError:
+        return jsonify({"error": "가이드 박스 좌표가 올바르지 않습니다."}), 400
+
+    if paper_w == 0 or paper_h == 0:
+        return jsonify({"error": "가이드 박스 좌표가 필요합니다. (paper_x, paper_y, paper_w, paper_h)"}), 400
+
+    paper_bbox = (paper_x, paper_y, paper_w, paper_h)
+
+    # 업로드된 이미지를 data/ 폴더에 임시 저장
+    save_path = os.path.join('data', file.filename)
+    file.save(save_path)
+
+    try:
+        # 측정 파이프라인 실행
+        img = load_image(save_path)
+        preprocessed = preprocess(img)
+
+        px_per_mm_x, px_per_mm_y, _ = get_pixel_per_mm(paper_bbox)
+
+        foot, roi_offset = find_foot_contour(preprocessed, paper_bbox)
+        result = measure_foot(foot, roi_offset, px_per_mm_x, px_per_mm_y)
+
+        # 결과 이미지 저장 (시각화용)
+        output_img = draw_result(img, paper_bbox, result)
+        output_path = os.path.join('data', 'result.jpg')
+        cv2.imwrite(output_path, output_img)
+
+        # bounding_box는 내부 데이터라 응답에서 제외
+        response = {
+            "발 길이 (mm)": result["발 길이 (mm)"],
+            "발볼 너비 (mm)": result["발볼 너비 (mm)"],
+            "발 길이 (cm)": result["발 길이 (cm)"],
+            "발볼 너비 (cm)": result["발볼 너비 (cm)"]
+        }
+
+        return jsonify(response), 200
+
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 422
+
+    except Exception as e:
+        return jsonify({"error": f"처리 중 오류 발생: {str(e)}"}), 500
+
+    finally:
+        cv2.destroyAllWindows()
+        import gc
+        gc.collect()
+        if os.path.exists(save_path):
+            try:
+                os.remove(save_path)
+            except PermissionError:
+                pass

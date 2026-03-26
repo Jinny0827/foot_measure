@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C C:/workspace/foot_measure status)",
+      "Bash(gh auth:*)",
+      "Bash(where gh:*)"
+    ]
+  }
+}
