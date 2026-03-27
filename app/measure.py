@@ -74,6 +74,98 @@ def refine_paper_bbox(img_bgr, guide_bbox):
     return (x1 + rx, y1 + ry, rw, rh)
 
 
+def detect_a4_paper(img, guide_bbox):
+    """
+    이미지에서 A4 용지를 실제로 감지하여 pixel_per_mm 계산
+
+    실패 케이스별 원인 메시지 반환:
+      - 흰 바닥: "바닥 색상이 A4 용지와 비슷합니다..."
+      - 형태 매칭 실패: "A4 용지 경계를 인식하지 못했습니다..."
+      - 용지 없음: "A4 용지를 찾지 못했습니다..."
+    """
+    px, py, pw, ph = guide_bbox
+    img_h, img_w = img.shape[:2]
+
+    # ── ROI: 가이드박스 + 소폭 여유 ──────────────────────────
+    m   = max(20, pw // 15)
+    rx1 = max(0, px - m);        ry1 = max(0, py - m)
+    rx2 = min(img_w, px+pw+m);   ry2 = min(img_h, py+ph+m)
+    roi = img[ry1:ry2, rx1:rx2]
+    roi_area = (rx2 - rx1) * (ry2 - ry1)
+
+    # ── HSV 흰색 마스크: 고명도(V>175) + 저채도(S<60) ────────
+    hsv  = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv,
+                       np.array([0,   0, 175]),
+                       np.array([180, 60, 255]))
+
+    # CLOSE(발이 덮은 구멍 메우기) → OPEN(노이즈 제거)
+    k_big   = np.ones((25, 25), np.uint8)
+    k_small = np.ones((9,  9),  np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_big,   iterations=3)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k_small, iterations=1)
+
+    # ── 흰색 비율로 바닥 색상 판별 ───────────────────────────
+    white_ratio = float(np.sum(mask > 0)) / mask.size
+
+    if white_ratio > 0.78:
+        raise ValueError(
+            "바닥 색상이 A4 용지와 비슷합니다. "
+            "어두운 색 바닥 위에서 다시 촬영해주세요."
+        )
+
+    # ── 윤곽 검출 ─────────────────────────────────────────────
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise ValueError(
+            "A4 용지를 찾지 못했습니다. "
+            "가이드 박스 안에 A4 전체가 보이도록 맞춰주세요."
+        )
+
+    # 면적 5% 이상인 흰색 영역만 사용
+    large = [c for c in contours if cv2.contourArea(c) > roi_area * 0.05]
+    if not large:
+        if white_ratio > 0.40:
+            raise ValueError(
+                "A4 용지 경계를 인식하지 못했습니다. "
+                "바닥이 밝은 색이라면 어두운 바닥에서 촬영해주세요."
+            )
+        raise ValueError(
+            "A4 용지를 찾지 못했습니다. "
+            "가이드 박스 안에 A4 전체가 보이도록 맞춰주세요."
+        )
+
+    # ── 모든 큰 흰색 영역 합산 → 전체 A4 범위 추정 ───────────
+    # (발이 가운데를 가려도 양쪽 끝이 보이면 전체 크기 추정 가능)
+    all_pts = np.vstack(large)
+    rect    = cv2.minAreaRect(all_pts)
+    (_, _), (w_px, h_px), _ = rect
+
+    # portrait 보정: 짧은 쪽 = 210mm, 긴 쪽 = 297mm
+    if w_px > h_px:
+        w_px, h_px = h_px, w_px
+
+    # ── A4 비율 검증 (210:297 ≈ 0.707) ──────────────────────
+    ratio    = w_px / h_px if h_px > 0 else 0
+    a4_ratio = A4_WIDTH_MM / A4_HEIGHT_MM   # ≈ 0.707
+
+    if abs(ratio - a4_ratio) > 0.25:
+        if white_ratio > 0.45:
+            raise ValueError(
+                "A4 용지 경계를 인식하지 못했습니다. "
+                "바닥이 밝은 색이라면 어두운 바닥에서 촬영해주세요."
+            )
+        raise ValueError(
+            "A4 용지 비율이 맞지 않습니다. "
+            "용지 전체가 가이드 박스 안에 들어오는지 확인해주세요."
+        )
+
+    px_per_mm_x = w_px / A4_WIDTH_MM
+    px_per_mm_y = h_px / A4_HEIGHT_MM
+    return px_per_mm_x, px_per_mm_y
+
+
 def get_pixel_per_mm(paper_bbox):
     """
     프론트에서 받은 가이드 박스 좌표로 1mm당 픽셀 수 계산

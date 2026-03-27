@@ -5,7 +5,7 @@ import base64
 from app.measure import (
     load_image,
     preprocess,
-    get_pixel_per_mm,
+    detect_a4_paper,
     find_foot_contour,
     measure_foot,
     draw_result,
@@ -63,8 +63,9 @@ def measure():
         img = load_image(save_path)
         preprocessed = preprocess(img)
 
-        # 가이드 박스 = A4 기준 (프론트에서 정확한 A4 비율로 계산됨)
-        px_per_mm_x, px_per_mm_y, _ = get_pixel_per_mm(paper_bbox)
+        # 이미지 내 A4 용지 실제 감지 → pixel_per_mm 계산
+        # 실패 시 원인별 에러 메시지 반환 (흰 바닥, 비율 불일치 등)
+        px_per_mm_x, px_per_mm_y = detect_a4_paper(img, paper_bbox)
 
         foot, roi_offset = find_foot_contour(preprocessed, paper_bbox)
         result = measure_foot(foot, roi_offset, px_per_mm_x, px_per_mm_y)
