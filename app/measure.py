@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import base64
 
 # A4 용지 실제 크기 (mm) - 픽셀→mm 변환 기준값
 A4_WIDTH_MM = 210
@@ -26,6 +27,52 @@ def preprocess(img):
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     blurred = cv2.GaussianBlur(hsv, (5,5), 0)
     return np.array(blurred)
+
+def refine_paper_bbox(img_bgr, guide_bbox):
+    """
+    가이드 박스를 힌트로 실제 용지 경계를 정밀 탐색
+    - 가이드 박스 ROI + 패딩 안에서 흰색 픽셀로 실제 용지 검출
+    - 검출 실패 또는 너무 작으면 가이드 박스 그대로 반환 (fallback)
+    """
+    px, py, pw, ph = guide_bbox
+    h, w = img_bgr.shape[:2]
+
+    # 가이드 박스 주변 10% 패딩으로 탐색 범위 확장
+    pad = int(min(pw, ph) * 0.1)
+    x1 = max(0, px - pad)
+    y1 = max(0, py - pad)
+    x2 = min(w, px + pw + pad)
+    y2 = min(h, py + ph + pad)
+
+    roi = img_bgr[y1:y2, x1:x2]
+    roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+
+    # 흰색 범위 (용지 감지)
+    lower_white = np.array([0,   0, 170])
+    upper_white = np.array([180, 40, 255])
+    mask = cv2.inRange(roi_hsv, lower_white, upper_white)
+
+    # 발이 덮은 구멍 채우기 → 외부 노이즈 제거
+    k_close = np.ones((30, 30), np.uint8)
+    k_open  = np.ones((10, 10), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  k_open)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return guide_bbox  # fallback
+
+    largest = max(contours, key=cv2.contourArea)
+
+    # 가이드 박스 면적의 30% 미만이면 신뢰하지 않고 fallback
+    if cv2.contourArea(largest) < pw * ph * 0.3:
+        return guide_bbox
+
+    rx, ry, rw, rh = cv2.boundingRect(largest)
+
+    # ROI 오프셋 더해서 원본 이미지 좌표로 변환
+    return (x1 + rx, y1 + ry, rw, rh)
+
 
 def get_pixel_per_mm(paper_bbox):
     """
@@ -58,9 +105,9 @@ def find_foot_contour(img, paper_bbox):
     # A4 영역만 잘라서 ROI로 사용
     roi = img[py:py+ph, px:px+pw]
 
-    # 피부색 범위 (HSV 기준) - 조명에 따라 튜닝 필요(인식이 안될 가능성 있음)
-    lower_skin = np.array([0,  50,  80])
-    upper_skin = np.array([25, 200, 255])
+    # 피부색 범위 (HSV 기준) - S/V 하한 올려서 그림자 제외
+    lower_skin = np.array([0,  80, 110])
+    upper_skin = np.array([25, 220, 255])
     mask = cv2.inRange(roi, lower_skin, upper_skin)
 
     # 모폴로지 클로징 : 발 윤곽 내부 빈 공간 채우기
@@ -103,6 +150,97 @@ def measure_foot(foot_contour, roi_offset, pixel_per_mm_x, pixel_per_mm_y):
         "bounding_box": (x + ox, y + oy, w, h)
     }
 
+def measure_arch_side(img_path, guide_x, guide_y, guide_w, guide_h, foot_length_mm=0.0):
+    """
+    옆면 촬영에서 아치 높이 및 평발 수준 측정
+    - guide_bbox: 프론트 가이드 박스 좌표 (옆면 가이드)
+    - foot_length_mm: Step1에서 측정한 발 길이 (스케일 기준값)
+    """
+    img = load_image(img_path)
+    preprocessed = preprocess(img)
+    guide_bbox = (guide_x, guide_y, guide_w, guide_h)
+
+    # 발 윤곽 검출 (기존 함수 재사용)
+    foot, roi_offset = find_foot_contour(preprocessed, guide_bbox)
+    ox, oy = roi_offset
+
+    # ROI 기준 → 절대 좌표
+    abs_foot = foot + np.array([[ox, oy]])
+    x, y, w, h = cv2.boundingRect(foot)       # ROI 기준 bbox
+    foot_abs_x = x + ox
+
+    # pixel_per_mm: Step1 발 길이를 스케일로 사용 (없으면 A4 너비 fallback)
+    if foot_length_mm > 10:
+        pixel_per_mm = w / foot_length_mm
+    else:
+        pixel_per_mm = guide_w / 210.0         # A4 너비 210mm
+
+    # 발 마스크 생성 (절대 좌표 기준)
+    img_h, img_w = img.shape[:2]
+    foot_mask = np.zeros((img_h, img_w), dtype=np.uint8)
+    cv2.drawContours(foot_mask, [abs_foot], -1, 255, -1)
+
+    # 각 열에서 최하단 발 픽셀 수집 → 바닥 프로파일
+    bottom_profile = []
+    for col in range(foot_abs_x, min(foot_abs_x + w, img_w)):
+        pix = np.where(foot_mask[:, col] > 0)[0]
+        if len(pix) > 0:
+            bottom_profile.append((col, int(pix.max())))
+
+    if len(bottom_profile) < 10:
+        raise ValueError("발 윤곽을 충분히 감지하지 못했습니다.")
+
+    # 바닥 기준선: 뒤꿈치(앞 15%) + 발끝(뒤 15%) 평균 y
+    heel_x  = foot_abs_x + int(w * 0.15)
+    toe_x   = foot_abs_x + int(w * 0.85)
+    floor_pts = [p[1] for p in bottom_profile if p[0] <= heel_x or p[0] >= toe_x]
+    floor_y = int(np.mean(floor_pts)) if floor_pts else max(p[1] for p in bottom_profile)
+
+    # 아치 구간(20~70%): 바닥에서 가장 높이 떠있는(y 최소) 지점
+    arch_x_s = foot_abs_x + int(w * 0.20)
+    arch_x_e = foot_abs_x + int(w * 0.70)
+    arch_pts  = [p for p in bottom_profile if arch_x_s <= p[0] <= arch_x_e]
+    if not arch_pts:
+        raise ValueError("아치 구간을 감지하지 못했습니다.")
+
+    arch_peak       = min(arch_pts, key=lambda p: p[1])
+    arch_height_px  = max(0, floor_y - arch_peak[1])
+    arch_height_mm  = arch_height_px / pixel_per_mm
+
+    # 아치 등급 분류
+    if arch_height_mm < 4:
+        arch_level, arch_score = '평발',    0
+    elif arch_height_mm < 10:
+        arch_level, arch_score = '저아치',  1
+    elif arch_height_mm < 20:
+        arch_level, arch_score = '정상',    2
+    else:
+        arch_level, arch_score = '높은 아치', 3
+
+    # 결과 이미지 시각화
+    out = img.copy()
+    cv2.drawContours(out, [abs_foot], -1, (0, 255, 0), 2)
+    # 바닥 기준선 (노란)
+    cv2.line(out, (foot_abs_x, floor_y), (foot_abs_x + w, floor_y), (0, 255, 255), 2)
+    # 아치 높이 수직선 (하늘색)
+    cv2.line(out, (arch_peak[0], arch_peak[1]), (arch_peak[0], floor_y), (255, 180, 0), 3)
+    # 텍스트
+    mid_y = (arch_peak[1] + floor_y) // 2
+    cv2.putText(out, f'{arch_height_mm:.1f}mm ({arch_level})',
+                (arch_peak[0] + 8, mid_y),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 180, 0), 2)
+
+    _, buf      = cv2.imencode('.jpg', out)
+    result_b64  = base64.b64encode(buf).decode('utf-8')
+
+    return {
+        'arch_height_mm': round(arch_height_mm, 1),
+        'arch_level':     arch_level,
+        'arch_score':     arch_score,
+        'result_image':   result_b64,
+    }
+
+
 def draw_result(img, paper_bbox, result):
     """
     결과 시각화
@@ -119,6 +257,15 @@ def draw_result(img, paper_bbox, result):
     # 발 bounding box 표시 (빨강)
     bx, by, bw, bh = result["bounding_box"]
     cv2.rectangle(out, (bx, by), (bx + bw, by + bh), (0, 0, 255), 2)
+
+    # 발끝(상단) 가로선 - 노란색
+    cv2.line(out, (px, by), (px + pw, by), (0, 255, 255), 2)
+    # 뒤꿈치(하단) 가로선 - 노란색
+    cv2.line(out, (px, by + bh), (px + pw, by + bh), (0, 255, 255), 2)
+    # 발볼 왼쪽 세로선 - 노란색
+    cv2.line(out, (bx, py), (bx, py + ph), (0, 255, 255), 2)
+    # 발볼 오른쪽 세로선 - 노란색
+    cv2.line(out, (bx + bw, py), (bx + bw, py + ph), (0, 255, 255), 2)
 
     # 측정값 텍스트 표시
     cv2.putText(out, f"Length: {result['발 길이 (cm)']}cm",

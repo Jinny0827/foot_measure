@@ -1,4 +1,5 @@
 from flask import Flask
+from flask_cors import CORS
 
 def create_app():
     """
@@ -7,6 +8,7 @@ def create_app():
     - Blueprint 등록
     """
     app = Flask(__name__)
+    CORS(app)
 
     # routes.py의 Blueprint 등록
     from app.routes import bp
